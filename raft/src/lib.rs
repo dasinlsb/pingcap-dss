@@ -1,5 +1,7 @@
 #![feature(integer_atomics)]
 #![deny(clippy::all)]
+#![allow(clippy::single_match)]
+#![allow(clippy::while_let_loop)]
 
 #[allow(unused_imports)]
 #[macro_use]
