@@ -1,25 +1,26 @@
 use crate::proto::raftpb::*;
 use crate::raft::INVALID_INDEX;
+use std::cell::RefCell;
 
 #[derive(Debug, Clone)]
 pub struct RaftLog {
-    data: Vec<Entry>,
+    data: RefCell<Vec<Entry>>,
 }
 
 impl RaftLog {
     pub fn count(&self) -> u64 {
-        self.data.len() as u64
+        self.data.borrow().len() as u64
     }
     pub fn term(&self, idx: u64) -> Option<u64> {
         if idx == INVALID_INDEX || idx > self.last_index() {
             None
         } else {
-            Some(self.data[idx as usize].term)
+            Some(self.data.borrow()[(idx - 1) as usize].term)
         }
     }
 
-    pub fn last_entry(&self) -> Option<&Entry> {
-        self.data.last()
+    pub fn last_entry(&self) -> Option<Entry> {
+        self.data.borrow().last().cloned()
     }
     pub fn last_index(&self) -> u64 {
         self.last_entry().map(|i| i.index).unwrap_or(INVALID_INDEX)
@@ -29,29 +30,37 @@ impl RaftLog {
         self.term(self.last_index()).unwrap_or(0)
     }
 
-    pub fn find_last_entry(&self, index: u64) -> Option<&Entry> {
-        for e in self.data.iter() {
-            if e.index == index {
-                return Some(e);
-            }
+    pub fn append_entries(&self, mut new_entries: Vec<Entry>) {
+        for (i, entry) in new_entries.iter().enumerate() {
+            debug_assert_eq!(
+                self.count() + 1 + i as u64,
+                entry.index,
+                "raft-log append entries index is not count+1"
+            );
         }
-        None
+        self.data.borrow_mut().append(&mut new_entries);
     }
 
-    /// new_entries - list (term, index)
-    pub fn remove_duplicate_entries(&mut self, new_entries: Vec<(u64, u64)>) {
-        if new_entries.is_empty() {
-            return;
-        }
-    }
-
-    pub fn append_entries(&mut self, mut new_entries: Vec<Entry>) {
-        self.data.append(&mut new_entries);
+    pub fn append_entry(&self, entry: Entry) {
+        debug_assert_eq!(
+            entry.index,
+            self.count() + 1,
+            "raft-log append entry index is not count+1"
+        );
+        self.data.borrow_mut().push(entry);
     }
 
     pub fn get_entries_from(&self, l: u64) -> Vec<Entry> {
         debug_assert!(l >= 1, "next log index should >= 1");
-        self.data[(l - 1) as usize..].to_vec()
+        self.data.borrow()[(l - 1) as usize..].to_vec()
+    }
+
+    pub fn get_entry(&self, i: u64) -> Entry {
+        debug_assert!(
+            1 <= i && i <= self.count(),
+            "raft-log get entry out of range"
+        );
+        self.data.borrow()[i as usize - 1].clone()
     }
 
     /// If the last entry(term, index) from candidate is up-to-date
@@ -65,14 +74,30 @@ impl RaftLog {
         term > self.last_term() || (term == self.last_term() && index >= self.last_index())
     }
 
+    pub fn get_possible_prev_index(&self, index: u64) -> u64 {
+        if index > self.count() {
+            self.last_index()
+        } else {
+            let mut i = index;
+            while i > 0 && self.get_entry(i).term == self.get_entry(index).term {
+                i -= 1;
+            }
+            i
+        }
+    }
+
     pub fn can_append(&self, term: u64, index: u64) -> bool {
         if index == INVALID_INDEX {
             return true;
         }
-        if index > self.data.len() as u64 {
+        if index > self.count() {
             return false;
         }
-        self.data[index as usize - 1].term == term
+        self.data.borrow()[index as usize - 1].term == term
+    }
+
+    pub fn restore(&mut self, data: Vec<Entry>) {
+        self.data = RefCell::new(data);
     }
 
     pub fn try_append(&mut self, term: u64, index: u64, entries: Vec<Entry>) -> bool {
@@ -89,21 +114,22 @@ impl RaftLog {
         // Find first invalid entry and remove everything following
         entries.iter().for_each(|e| {
             let i = e.index as usize - 1;
-            if i >= self.data.len() {
+            let mut data = self.data.borrow_mut();
+            if i >= data.len() {
                 debug_assert_eq!(
                     i,
-                    self.data.len(),
+                    data.len(),
                     "try_append error: incoming entries with bigger index than expected"
                 );
-                self.data.push(e.clone());
+                data.push(e.clone());
             } else {
-                self.data[i] = e.clone();
+                data[i] = e.clone();
             }
             // Entries index must be continuous
             if i == 0 {
-                debug_assert_eq!(self.data[i].index, 1);
+                debug_assert_eq!(data[i].index, 1);
             } else {
-                debug_assert_eq!(self.data[i].index, self.data[i - 1].index + 1)
+                debug_assert_eq!(data[i].index, data[i - 1].index + 1)
             }
         });
         true
@@ -113,7 +139,7 @@ impl RaftLog {
 impl Default for RaftLog {
     fn default() -> Self {
         Self {
-            data: Vec::default(),
+            data: RefCell::new(vec![]),
         }
     }
 }

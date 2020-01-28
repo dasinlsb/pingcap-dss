@@ -22,6 +22,12 @@ use std::ops::Deref;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, PartialEq, Message)]
+pub struct ConfigEntry {
+    #[prost(uint64, tag = "100")]
+    pub x: u64,
+}
+
 pub struct ApplyMsg {
     pub command_valid: bool,
     pub command: Vec<u8>,
@@ -62,8 +68,8 @@ impl State {
 pub const INVALID_ID: u64 = 0;
 pub const INVALID_INDEX: u64 = 0;
 
-const ELECTION_TIMEOUT: usize = 7;
-const HEARTBEAT_TIMEOUT: usize = 4;
+const ELECTION_TIMEOUT: usize = 6;
+const HEARTBEAT_TIMEOUT: usize = 3;
 
 // A single Raft peer.
 pub struct Raft {
@@ -94,6 +100,8 @@ pub struct Raft {
     pub match_index: Vec<u64>,
     pub msg_recv: Receiver<Message>,
     pub msg_send: Arc<Mutex<Sender<Message>>>,
+    pub commit_index: u64,
+    pub last_applied: u64,
 }
 
 impl Raft {
@@ -129,7 +137,7 @@ impl Raft {
             log: Default::default(),
             role: Default::default(),
             election_elapsed: 0,
-            random_election_timeout: ELECTION_TIMEOUT + rand::random::<usize>() % 4,
+            random_election_timeout: ELECTION_TIMEOUT + rand::random::<usize>() % 7,
             heartbeat_elapsed: 0,
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
             voters: HashSet::new(),
@@ -137,6 +145,8 @@ impl Raft {
             match_index: vec![0; n],
             msg_recv: rx,
             msg_send: Arc::new(Mutex::new(tx)),
+            commit_index: 0,
+            last_applied: 0,
         };
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
@@ -147,12 +157,20 @@ impl Raft {
     /// save Raft's persistent state to stable storage,
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
-    fn persist(&mut self) {
+    fn persist(&self) {
         // Your code here (2C).
         // Example:
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
         // self.persister.save_raft_state(data);
+        let mut buf = vec![];
+        let snap = Snapshot {
+            term: self.term,
+            vote: self.vote,
+            log: self.log.get_entries_from(1),
+        };
+        labcodec::encode(&snap, &mut buf).unwrap();
+        self.persister.save_raft_state(buf);
     }
 
     /// restore previously persisted state.
@@ -172,6 +190,17 @@ impl Raft {
         //         panic!("{:?}", e);
         //     }
         // }
+        match labcodec::decode::<Snapshot>(data) {
+            Ok(o) => {
+                info!("Raft id={} is restoring data: {:?}", self.id, &o);
+                self.term = o.term;
+                self.vote = o.vote;
+                self.log.restore(o.log);
+            }
+            Err(e) => {
+                panic!("{:?}", e);
+            }
+        }
     }
 
     fn get_peer_by_id(&self, id: u64) -> &RaftClient {
@@ -219,23 +248,6 @@ impl Raft {
         }
         // Now m.term needs no consideration
         match m.msg_type() {
-            MessageType::MsgRequestVote => {
-                let can_vote = (self.vote == m.from) || (self.vote == INVALID_ID);
-                self.vote = m.from;
-                let mut resp = self.my_message();
-                resp.set_msg_type(MessageType::MsgRequestVoteResponse);
-                resp.to = m.from;
-                if can_vote && self.log.is_up_to_date(m.term, m.log_index) {
-                    resp.accept = true;
-                } else {
-                    resp.accept = false;
-                }
-                info!(
-                    "Raft id={} responds MsgRequestVote from id={} accept={}",
-                    self.id, m.from, resp.accept
-                );
-                self.send_message_to_id(&resp);
-            }
             _ => match self.role {
                 Role::Leader => self.step_leader(m)?,
                 Role::Candidate => self.step_candidate(m)?,
@@ -284,7 +296,36 @@ impl Raft {
     fn step_follower(&mut self, m: Message) -> Result<()> {
         match m.msg_type() {
             MessageType::MsgAppend => {
+                self.leader_id = m.from;
                 self.handle_append(m);
+            }
+            MessageType::MsgRequestVote => {
+                let can_vote = (self.vote == m.from) || (self.vote == INVALID_ID);
+                let mut resp = self.my_message();
+                resp.set_msg_type(MessageType::MsgRequestVoteResponse);
+                resp.to = m.from;
+                if can_vote && self.log.is_up_to_date(m.log_term, m.log_index) {
+                    /*
+                    println!("raft id={} last_index={} thinks candidate id={} log_index={}, log_term={} is up-to-date",
+                             self.id,
+                             self.last_log_index(),
+                             m.from,
+                             m.log_index,
+                             m.log_term,
+                    );
+                    */
+                    self.vote = m.from;
+                    self.persist();
+                    resp.accept = true;
+                    self.election_elapsed = 0;
+                } else {
+                    resp.accept = false;
+                }
+                info!(
+                    "Raft id={} responds MsgRequestVote from id={} accept={}",
+                    self.id, m.from, resp.accept
+                );
+                self.send_message_to_id(&resp);
             }
             _ => {}
         }
@@ -347,24 +388,110 @@ impl Raft {
         }
     }
 
+    fn has_majority_replications(&self, n: u64) -> bool {
+        self.match_index
+            .iter()
+            .enumerate()
+            .filter(|(i, index)| *i == self.me || **index >= n)
+            .count()
+            >= (self.peers.len() + 1) / 2
+    }
+
+    fn do_commit(&mut self) {
+        while self.commit_index > self.last_applied {
+            self.last_applied += 1;
+            let entry = self.log.get_entry(self.last_applied);
+            let amsg = ApplyMsg {
+                command_valid: true,
+                command: entry.data.clone(),
+                command_index: entry.index,
+            };
+            let e: ConfigEntry = labcodec::decode(&entry.data[..]).unwrap();
+            info!(
+                "Raft id={} commit {:?}, index={}",
+                self.id, &e.x, entry.index
+            );
+            self.apply_ch.unbounded_send(amsg).unwrap();
+        }
+    }
+
     fn handle_append_response(&mut self, m: Message) {
         let i = m.from as usize - 1;
         if m.accept {
-            self.next_index[i] = self.last_log_index() + 1;
-            self.match_index[i] = self.last_log_index();
+            self.next_index[i] = m.log_index + 1;
+            self.match_index[i] = m.log_index;
+            for n in self.commit_index + 1..self.next_index[i] {
+                if self.has_majority_replications(n) && self.log.get_entry(n).term == self.term {
+                    self.update_commit_index(n);
+                }
+            }
         } else {
-            self.next_index[i] -= 1;
+            self.next_index[i] = m.log_index + 1;
         }
+    }
+
+    fn update_commit_index(&mut self, commit_index: u64) {
+        self.commit_index = commit_index;
+        self.do_commit();
     }
 
     /// Respond when m.msg_type() == MessageType::MsgAppend
     fn handle_append(&mut self, m: Message) {
+        debug_assert_eq!(
+            self.role,
+            Role::Follower,
+            "Not Follower when appending entries"
+        );
+        info!(
+            "Raft id={} last_index={} is handling MsgAppend from={}",
+            self.id,
+            self.last_log_index(),
+            m.from
+        );
         self.election_elapsed = 0;
-        self.log.try_append(m.term, m.log_index, m.entries);
         let mut resp = self.my_message();
         resp.set_msg_type(MessageType::MsgAppendResponse);
         resp.to = m.from;
-        resp.accept = true;
+        if !self.log.can_append(m.log_term, m.log_index) {
+            resp.accept = false;
+            resp.log_index = self.log.get_possible_prev_index(m.log_index);
+            if !m.entries.is_empty() {
+                if m.log_index > self.log.count() {
+                    info!(
+                        "Raft reject MsgAppend: out of range, m.index={}",
+                        m.log_index
+                    );
+                } else {
+                    let e = self.log.get_entry(m.log_index);
+                    info!(
+                        "Raft id={} reject MsgAppend: m.index={}, m.term={}, but log.term={}",
+                        self.id, m.log_index, m.log_term, e.term
+                    );
+                }
+            }
+        } else {
+            resp.accept = true;
+            if !m.entries.is_empty() {
+                // Get the newly commited log index from Leader
+                // Set it to resp.log_index to let Leader knows
+                resp.log_index = m.entries.last().unwrap().index;
+                self.log
+                    .try_append(m.log_term, m.log_index, m.entries.clone());
+                self.persist();
+                info!(
+                    "Raft id={} accept MsgAppend from id={}, last_index={}, total_logs={}",
+                    self.id,
+                    resp.to,
+                    m.entries.last().unwrap().index,
+                    self.log.count(),
+                );
+            }
+            if m.commit > self.commit_index {
+                // Leader always sends all entries to Follower
+                // So the index of last new entry is never less than m.commit
+                self.update_commit_index(m.commit);
+            }
+        }
         self.send_message_to_id(&resp);
     }
 
@@ -382,6 +509,16 @@ impl Raft {
                 msg.log_index = prev_log_index;
                 msg.log_term = self.log.term(prev_log_index).unwrap_or(0);
                 msg.entries = self.log.get_entries_from(self.next_index[i]);
+                if !msg.entries.is_empty() {
+                    info!(
+                        "MsgAppend broadcast from={}, pre_index={}, pre_term={}, r={}",
+                        self.id,
+                        msg.log_index,
+                        msg.log_term,
+                        msg.entries.last().unwrap().index
+                    );
+                }
+                msg.commit = self.commit_index;
                 self.send_message(peer, &msg);
             });
     }
@@ -415,6 +552,7 @@ impl Raft {
         self.election_elapsed = 0;
         self.role = Role::Candidate;
         self.update_state();
+        self.persist();
     }
 
     fn become_leader(&mut self) {
@@ -425,7 +563,12 @@ impl Raft {
             self.role
         );
         info!("Raft id={} become Leader", self.id);
+        self.vote = INVALID_ID;
         self.leader_id = self.id;
+        for i in 0..self.peers.len() {
+            self.next_index[i] = self.last_log_index() + 1;
+            self.match_index[i] = self.last_log_index();
+        }
         self.role = Role::Leader;
         self.update_state();
     }
@@ -435,17 +578,16 @@ impl Raft {
             "Raft id={} become Follower term={}, leader_id={}",
             self.id, term, leader_id
         );
-        self.role = Role::Follower;
         self.term = term;
         self.leader_id = leader_id;
         self.vote = INVALID_ID;
         self.voters.clear();
-        self.election_elapsed = 0;
-        for i in 0..self.peers.len() {
-            self.next_index[i] = 1;
-            self.match_index[i] = 0;
+        if self.role != Role::Follower {
+            self.election_elapsed = 0;
         }
+        self.role = Role::Follower;
         self.update_state();
+        self.persist();
     }
 
     fn send_message_to_id(&self, m: &Message) {
@@ -501,15 +643,20 @@ impl Raft {
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
+        if self.state.is_leader {
+            let entry = Entry {
+                term: self.term,
+                index: self.last_log_index() + 1,
+                data: buf,
+            };
+            info!("Raft id={} replicates data: index={}", self.id, entry.index);
+            self.log.append_entry(entry.clone());
+            self.persist();
+            // self.broadcast_append();
+            Ok((entry.index, entry.term))
         } else {
             Err(Error::NotLeader)
         }
@@ -519,17 +666,7 @@ impl Raft {
 impl Raft {
     /// Only for suppressing deadcode warnings.
     #[doc(hidden)]
-    pub fn __suppress_deadcode(&mut self) {
-        let _ = self.start(&0);
-        self.persist();
-        let _ = &self.state;
-        let _ = &self.me;
-        let _ = &self.persister;
-        let _ = &self.peers;
-
-        let _ = &self.apply_ch;
-        let _ = &self.log;
-    }
+    pub fn __suppress_deadcode(&mut self) {}
 }
 
 // Choose concurrency paradigm.
@@ -564,7 +701,7 @@ impl Node {
         let mut instant = Instant::now();
         thread::spawn(move || loop {
             // no message after election timeout
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(6));
             let mut rf = arf2.lock().unwrap();
             loop {
                 match rf.msg_recv.try_recv() {
@@ -572,7 +709,7 @@ impl Node {
                     Err(_) => break,
                 }
             }
-            // ticks every 50 ms(gcd of all operating durations)
+            // ticks every 40 ms(gcd of all operating durations)
             if instant.elapsed() > Duration::from_millis(30) {
                 rf.tick();
                 instant = Instant::now();
@@ -607,7 +744,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        crate::your_code_here(command)
+        self.raft.lock().unwrap().start(command)
     }
 
     /// The current term of this peer.
@@ -650,14 +787,6 @@ impl RaftService for Node {
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn handle_message(&self, m: Message) -> RpcFuture<()> {
-        /*
-        info!(
-            "[Rpc] message from={} to={} type={:?}",
-            m.from,
-            m.to,
-            m.msg_type()
-        );
-        */
         let rf = self.raft.lock().unwrap();
         rf.msg_send.lock().unwrap().send(m).unwrap();
         //            .map_err(|e| Error::Rpc(labrpc::Error::Other(
