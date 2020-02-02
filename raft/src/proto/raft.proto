@@ -38,6 +38,8 @@ enum MessageType {
     MsgRequestVoteResponse = 3;
     MsgHeartbeat = 4;
     MsgHeartbeatResponse = 5;
+  MsgRequestPreVote = 6;
+  MsgRequestPreVoteResponse = 7;
 }
 
 message Message {

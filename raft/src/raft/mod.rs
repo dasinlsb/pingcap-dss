@@ -28,6 +28,7 @@ pub struct ConfigEntry {
     pub x: u64,
 }
 
+#[derive(Clone)]
 pub struct ApplyMsg {
     pub command_valid: bool,
     pub command: Vec<u8>,
@@ -46,6 +47,7 @@ pub enum Role {
     Follower,
     Leader,
     Candidate,
+    PreCandidate,
 }
 
 impl Default for Role {
@@ -65,11 +67,25 @@ impl State {
     }
 }
 
+pub fn resp_msg_type(ty: MessageType) -> MessageType {
+    match ty {
+        MessageType::MsgAppend => MessageType::MsgAppendResponse,
+        MessageType::MsgRequestPreVote => MessageType::MsgRequestPreVoteResponse,
+        MessageType::MsgRequestVote => MessageType::MsgRequestVoteResponse,
+        _ => unimplemented!(),
+    }
+}
+
 pub const INVALID_ID: u64 = 0;
 pub const INVALID_INDEX: u64 = 0;
 
 const ELECTION_TIMEOUT: usize = 6;
 const HEARTBEAT_TIMEOUT: usize = 3;
+
+pub enum CampaignType {
+    Election,
+    PreElection,
+}
 
 // A single Raft peer.
 pub struct Raft {
@@ -192,7 +208,7 @@ impl Raft {
         // }
         match labcodec::decode::<Snapshot>(data) {
             Ok(o) => {
-                info!("Raft id={} is restoring data: {:?}", self.id, &o);
+                // info!("Raft id={} is restoring data: {:?}", self.id, &o);
                 self.term = o.term;
                 self.vote = o.vote;
                 self.log.restore(o.log);
@@ -219,38 +235,80 @@ impl Raft {
 
     /// Handle response message
     fn step(&mut self, m: Message) -> Result<()> {
-        //        println!("[step] {:?}", &m);
+        // println!("Raft id={} [step] {:?}", self.id, &m);
         if m.term > self.term {
-            if m.msg_type() == MessageType::MsgAppend {
+            if m.msg_type() == MessageType::MsgRequestPreVote {
+                // do not update term
+            } else if m.msg_type() == MessageType::MsgAppend {
                 self.become_follower(m.term, m.from);
             } else {
                 self.become_follower(m.term, INVALID_ID);
             }
         } else if m.term < self.term {
-            if m.msg_type() == MessageType::MsgAppend {
-                let mut resp = self.my_message();
-                resp.set_msg_type(MessageType::MsgAppendResponse);
-                resp.to = m.from;
-                resp.accept = false;
-                self.send_message_to_id(&resp);
-                return Ok(());
-            } else if m.msg_type() == MessageType::MsgRequestVote {
-                let mut resp = self.my_message();
-                resp.set_msg_type(MessageType::MsgRequestVoteResponse);
-                resp.to = m.from;
-                resp.accept = false;
-                self.send_message_to_id(&resp);
-                return Ok(());
-            } else {
-                // Respond nothing
+            match m.msg_type() {
+                MessageType::MsgAppend
+                | MessageType::MsgRequestPreVote
+                | MessageType::MsgRequestVote => {
+                    let mut resp = self.my_message();
+                    resp.set_msg_type(resp_msg_type(m.msg_type()));
+                    resp.to = m.from;
+                    resp.accept = false;
+                    self.send_message_to_id(&resp);
+                }
+                _ => {}
             }
+            // info!("Raft id={} receive msg from={} lower_term={}", self.id, m.from, m.term);
             return Ok(());
         }
         // Now m.term needs no consideration
         match m.msg_type() {
+            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {
+                let can_vote = (self.vote == m.from) ||
+                    (self.vote == INVALID_ID && self.leader_id == INVALID_ID) ||
+                // multiple candidates never elect new leaders
+                // as they already vote for themselves
+                // so here, a pre-candidate can vote to other pre-candidate with larger term
+                    (m.msg_type() == MessageType::MsgRequestPreVote && m.term > self.term);
+                let mut resp = self.my_message();
+                resp.set_msg_type(resp_msg_type(m.msg_type()));
+                resp.to = m.from;
+                if can_vote && self.log.is_up_to_date(m.log_term, m.log_index) {
+                    /*
+                    println!("raft id={} last_index={} thinks candidate id={} log_index={}, log_term={} is up-to-date",
+                             self.id,
+                             self.last_log_index(),
+                             m.from,
+                             m.log_index,
+                             m.log_term,
+                    );
+                     */
+                    if m.msg_type() == MessageType::MsgRequestVote {
+                        self.vote = m.from;
+                        self.persist();
+                        self.election_elapsed = 0;
+                    }
+                    resp.term = m.term;
+                    resp.accept = true;
+                    info!(
+                        "Raft id={} grant {:?} to {}",
+                        self.id,
+                        resp.msg_type(),
+                        resp.to
+                    );
+                } else {
+                    resp.accept = false;
+                }
+                /*
+                info!(
+                    "Raft id={} responds MsgRequestVote from id={} accept={}",
+                    self.id, m.from, resp.accept
+                );
+                */
+                self.send_message_to_id(&resp);
+            }
             _ => match self.role {
                 Role::Leader => self.step_leader(m)?,
-                Role::Candidate => self.step_candidate(m)?,
+                Role::Candidate | Role::PreCandidate => self.step_candidate(m)?,
                 Role::Follower => self.step_follower(m)?,
             },
         }
@@ -269,19 +327,37 @@ impl Raft {
 
     fn step_candidate(&mut self, m: Message) -> Result<()> {
         match m.msg_type() {
-            MessageType::MsgRequestVoteResponse => {
+            MessageType::MsgRequestPreVoteResponse | MessageType::MsgRequestVoteResponse => {
+                if self.role == Role::Candidate
+                    && m.msg_type() == MessageType::MsgRequestPreVoteResponse
+                    || self.role == Role::PreCandidate
+                        && m.msg_type() == MessageType::MsgRequestVoteResponse
+                {
+                    return Ok(());
+                }
                 if !m.accept {
                     return Ok(());
                 }
                 self.voters.insert(m.from);
-                info!("Candidate id={} receive MsgRequestVoteResponse from id={}, accept={}, total={}",
-                      self.id,
-                      m.from,
-                      m.accept,
-                      self.voters.len()
+                info!(
+                    "Candidate id={} receive {:?} from id={}, accept={}, total={}",
+                    self.id,
+                    m.msg_type(),
+                    m.from,
+                    m.accept,
+                    self.voters.len()
                 );
                 if self.has_majority_voters() {
-                    self.become_leader();
+                    match self.role {
+                        Role::PreCandidate => {
+                            self.campaign(CampaignType::Election);
+                        }
+                        Role::Candidate => {
+                            self.become_leader();
+                            self.broadcast_append();
+                        }
+                        _ => unimplemented!(),
+                    }
                 }
             }
             MessageType::MsgAppend => {
@@ -299,34 +375,6 @@ impl Raft {
                 self.leader_id = m.from;
                 self.handle_append(m);
             }
-            MessageType::MsgRequestVote => {
-                let can_vote = (self.vote == m.from) || (self.vote == INVALID_ID);
-                let mut resp = self.my_message();
-                resp.set_msg_type(MessageType::MsgRequestVoteResponse);
-                resp.to = m.from;
-                if can_vote && self.log.is_up_to_date(m.log_term, m.log_index) {
-                    /*
-                    println!("raft id={} last_index={} thinks candidate id={} log_index={}, log_term={} is up-to-date",
-                             self.id,
-                             self.last_log_index(),
-                             m.from,
-                             m.log_index,
-                             m.log_term,
-                    );
-                    */
-                    self.vote = m.from;
-                    self.persist();
-                    resp.accept = true;
-                    self.election_elapsed = 0;
-                } else {
-                    resp.accept = false;
-                }
-                info!(
-                    "Raft id={} responds MsgRequestVote from id={} accept={}",
-                    self.id, m.from, resp.accept
-                );
-                self.send_message_to_id(&resp);
-            }
             _ => {}
         }
         Ok(())
@@ -335,7 +383,7 @@ impl Raft {
     fn tick(&mut self) {
         //        println!("raft id={} role={:?} ticks", self.id, self.role);
         match self.role {
-            Role::Follower | Role::Candidate => self.tick_election(),
+            Role::Follower | Role::Candidate | Role::PreCandidate => self.tick_election(),
             Role::Leader => self.tick_heartbeat(),
         }
     }
@@ -362,17 +410,37 @@ impl Raft {
         m
     }
 
+    fn become_pre_candidate(&mut self) {
+        info!("Raft id={} become pre-candidate", self.id);
+        self.voters.clear();
+        self.election_elapsed = 0;
+        self.leader_id = INVALID_ID;
+        self.role = Role::PreCandidate;
+        self.update_state();
+        self.persist();
+    }
+
     /// Follower will campaign for Leader
-    fn campaign(&mut self) {
+    fn campaign(&mut self, campaign_type: CampaignType) {
         info!("Raft id={} starts campaign", self.id);
-        self.become_candidate();
+        match campaign_type {
+            CampaignType::PreElection => {
+                self.term += 1;
+                self.become_pre_candidate();
+            }
+            CampaignType::Election => self.become_candidate(),
+        };
+        self.voters.insert(self.id);
         self.peers
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != self.me)
             .for_each(|(i, peer)| {
                 let mut msg = self.my_message();
-                msg.set_msg_type(MessageType::MsgRequestVote);
+                match campaign_type {
+                    CampaignType::PreElection => msg.set_msg_type(MessageType::MsgRequestPreVote),
+                    CampaignType::Election => msg.set_msg_type(MessageType::MsgRequestVote),
+                }
                 msg.to = Self::get_id(i);
                 msg.log_index = self.last_log_index();
                 msg.log_term = self.last_log_term();
@@ -384,7 +452,7 @@ impl Raft {
         self.election_elapsed += 1;
         if self.election_elapsed > self.random_election_timeout {
             self.election_elapsed = 0;
-            self.campaign();
+            self.campaign(CampaignType::PreElection);
         }
     }
 
@@ -406,11 +474,14 @@ impl Raft {
                 command: entry.data.clone(),
                 command_index: entry.index,
             };
+            /*
             let e: ConfigEntry = labcodec::decode(&entry.data[..]).unwrap();
             info!(
                 "Raft id={} commit {:?}, index={}",
                 self.id, &e.x, entry.index
             );
+             */
+            info!("Raft id={} commit, index={}", self.id, entry.index);
             self.apply_ch.unbounded_send(amsg).unwrap();
         }
     }
@@ -442,12 +513,14 @@ impl Raft {
             Role::Follower,
             "Not Follower when appending entries"
         );
+        /*
         info!(
             "Raft id={} last_index={} is handling MsgAppend from={}",
             self.id,
             self.last_log_index(),
             m.from
         );
+        */
         self.election_elapsed = 0;
         let mut resp = self.my_message();
         resp.set_msg_type(MessageType::MsgAppendResponse);
@@ -455,20 +528,22 @@ impl Raft {
         if !self.log.can_append(m.log_term, m.log_index) {
             resp.accept = false;
             resp.log_index = self.log.get_possible_prev_index(m.log_index);
-            if !m.entries.is_empty() {
-                if m.log_index > self.log.count() {
-                    info!(
-                        "Raft reject MsgAppend: out of range, m.index={}",
-                        m.log_index
-                    );
-                } else {
-                    let e = self.log.get_entry(m.log_index);
-                    info!(
-                        "Raft id={} reject MsgAppend: m.index={}, m.term={}, but log.term={}",
-                        self.id, m.log_index, m.log_term, e.term
-                    );
-                }
+        /*
+        if !m.entries.is_empty() {
+            if m.log_index > self.log.count() {
+                info!(
+                    "Raft reject MsgAppend: out of range, m.index={}",
+                    m.log_index
+                );
+            } else {
+                let e = self.log.get_entry(m.log_index);
+                info!(
+                    "Raft id={} reject MsgAppend: m.index={}, m.term={}, but log.term={}",
+                    self.id, m.log_index, m.log_term, e.term
+                );
             }
+        }
+        */
         } else {
             resp.accept = true;
             if !m.entries.is_empty() {
@@ -478,6 +553,7 @@ impl Raft {
                 self.log
                     .try_append(m.log_term, m.log_index, m.entries.clone());
                 self.persist();
+                /*
                 info!(
                     "Raft id={} accept MsgAppend from id={}, last_index={}, total_logs={}",
                     self.id,
@@ -485,6 +561,7 @@ impl Raft {
                     m.entries.last().unwrap().index,
                     self.log.count(),
                 );
+                */
             }
             if m.commit > self.commit_index {
                 // Leader always sends all entries to Follower
@@ -496,7 +573,7 @@ impl Raft {
     }
 
     fn broadcast_append(&self) {
-        info!("Raft id={} broadcast MsgAppend", self.id);
+        // info!("Raft id={} broadcast MsgAppend", self.id);
         self.peers
             .iter()
             .enumerate()
@@ -509,6 +586,7 @@ impl Raft {
                 msg.log_index = prev_log_index;
                 msg.log_term = self.log.term(prev_log_index).unwrap_or(0);
                 msg.entries = self.log.get_entries_from(self.next_index[i]);
+                /*
                 if !msg.entries.is_empty() {
                     info!(
                         "MsgAppend broadcast from={}, pre_index={}, pre_term={}, r={}",
@@ -518,6 +596,7 @@ impl Raft {
                         msg.entries.last().unwrap().index
                     );
                 }
+                */
                 msg.commit = self.commit_index;
                 self.send_message(peer, &msg);
             });
@@ -545,10 +624,9 @@ impl Raft {
             "invalid transfer: Leader -> Candidate"
         );
         info!("Raft id={} become candidate", self.id);
-        self.term += 1;
+        self.leader_id = INVALID_ID;
         self.vote = self.id;
         self.voters.clear();
-        self.voters.insert(self.id);
         self.election_elapsed = 0;
         self.role = Role::Candidate;
         self.update_state();
@@ -571,6 +649,7 @@ impl Raft {
         }
         self.role = Role::Leader;
         self.update_state();
+        self.persist();
     }
 
     fn become_follower(&mut self, term: u64, leader_id: u64) {
@@ -582,9 +661,7 @@ impl Raft {
         self.leader_id = leader_id;
         self.vote = INVALID_ID;
         self.voters.clear();
-        if self.role != Role::Follower {
-            self.election_elapsed = 0;
-        }
+        self.election_elapsed = 0;
         self.role = Role::Follower;
         self.update_state();
         self.persist();
@@ -778,6 +855,8 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+        let rf = self.raft.lock().unwrap();
+        info!("Killing Raft id={}...", rf.id);
         self.tx_stop.send(()).unwrap();
     }
 }
